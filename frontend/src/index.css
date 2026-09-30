@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+mark {
+  /* browser default mark styles override */
+  background-color: transparent;
+}
