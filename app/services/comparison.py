@@ -1,8 +1,9 @@
 from sqlalchemy.orm import Session
+
+from app.config import settings
 from app.models import Document
 from app.schemas import CheckResponse, DocumentMatch, MatchedPassage
 from app.services.fingerprint import build_fingerprints, jaccard_similarity
-from app.config import settings
 
 _VERDICT_THRESHOLDS = {
     "plagiarized": 0.50,

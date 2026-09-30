@@ -1,10 +1,12 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
 from app.config import settings
-from app.database import engine, Base
-from app.routers import documents, check
+from app.database import Base, engine
+from app.routers import check, documents
 
 
 @asynccontextmanager
