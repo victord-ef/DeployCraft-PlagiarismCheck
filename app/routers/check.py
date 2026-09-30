@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, UploadFile, File
+from fastapi import APIRouter, Depends, File, UploadFile
 from sqlalchemy.orm import Session
+
 from app.database import get_db
+from app.routers.documents import _parse_upload
 from app.schemas import CheckRequest, CheckResponse
 from app.services.comparison import check_text
-from app.routers.documents import _parse_upload
 
 router = APIRouter(prefix="/check", tags=["check"])
 

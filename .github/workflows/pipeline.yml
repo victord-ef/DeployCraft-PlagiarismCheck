@@ -1,0 +1,241 @@
+name: Pipeline
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+
+  # ── 1. Backend lint + test ───────────────────────────────────────────────────
+  backend:
+    name: Backend — Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check app/
+
+      - name: Test (pytest)
+        run: pytest tests/ -v --tb=short
+
+  # ── 2. Frontend build ────────────────────────────────────────────────────────
+  frontend:
+    name: Frontend — Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist-${{ github.sha }}
+          path: frontend/dist/
+          retention-days: 7
+
+  # ── 3. Docker build & push (push events only) ────────────────────────────────
+  #
+  #  Builds a multi-stage image (frontend → backend) and pushes to GHCR.
+  #  Tag strategy:
+  #    ghcr.io/owner/repo:<short-sha>   ← used for deployment (immutable)
+  #    ghcr.io/owner/repo:dev           ← latest on dev branch
+  #    ghcr.io/owner/repo:main          ← latest on main branch
+  #
+  docker:
+    name: Docker — Build & Push
+    needs: [backend, frontend]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+      tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=ref,event=branch
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── 4. Deploy → Dev ──────────────────────────────────────────────────────────
+  #
+  #  Triggered only on push to `dev`.
+  #  The branch-protection rule on `main` ensures code always passes through
+  #  dev deployment before it can be promoted to production.
+  #
+  #  Required GitHub secrets / variables (Settings → Secrets and Variables):
+  #
+  #  Fly.io option (primary):
+  #    Secrets : FLY_API_TOKEN_DEV
+  #    Variables: FLY_APP_DEV, DEV_URL
+  #
+  #  SSH + Docker option (alternative):
+  #    Secrets : DEV_SSH_KEY, DEV_SSH_USER, DEV_HOST, DEV_DATABASE_URL
+  #    Variables: DEV_URL
+  #
+  deploy-dev:
+    name: Deploy → Dev
+    needs: docker
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+      url: ${{ vars.DEV_URL }}
+    steps:
+      - name: Deploy
+        run: |
+          set -euo pipefail
+          IMAGE="${{ needs.docker.outputs.image }}:${{ needs.docker.outputs.tag }}"
+          echo "Image: $IMAGE"
+
+          if [[ -n "${FLY_API_TOKEN:-}" && -n "${FLY_APP:-}" ]]; then
+            echo "▶ Deploying via Fly.io → $FLY_APP"
+            curl -fsSL https://fly.io/install.sh | sh
+            export PATH="$HOME/.fly/bin:$PATH"
+            fly deploy --app "$FLY_APP" --image "$IMAGE" --strategy rolling
+
+          elif [[ -n "${SSH_HOST:-}" ]]; then
+            echo "▶ Deploying via SSH → $SSH_HOST"
+            printf '%s' "$SSH_KEY" > /tmp/id_rsa && chmod 600 /tmp/id_rsa
+            ssh -i /tmp/id_rsa -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "
+              docker pull $IMAGE
+              docker stop plagiarism-dev 2>/dev/null || true
+              docker rm   plagiarism-dev 2>/dev/null || true
+              docker run -d --name plagiarism-dev -p 8000:8000 \
+                --env DATABASE_URL='$DATABASE_URL' \
+                --restart unless-stopped \
+                $IMAGE
+            "
+
+          else
+            echo "⚠  No deployment target configured for dev."
+            echo "   Add FLY_API_TOKEN_DEV + FLY_APP_DEV  (Fly.io)"
+            echo "   or DEV_SSH_KEY + DEV_HOST             (SSH+Docker)"
+            echo "   in Settings → Secrets and Variables → Actions."
+          fi
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_DEV }}
+          FLY_APP: ${{ vars.FLY_APP_DEV }}
+          SSH_KEY: ${{ secrets.DEV_SSH_KEY }}
+          SSH_USER: ${{ secrets.DEV_SSH_USER }}
+          SSH_HOST: ${{ secrets.DEV_HOST }}
+          DATABASE_URL: ${{ secrets.DEV_DATABASE_URL }}
+
+  # ── 5. Deploy → Production ───────────────────────────────────────────────────
+  #
+  #  Triggered only on push to `main`.
+  #  `main` is protected: direct pushes blocked, requires PR from `dev`.
+  #  The production GitHub Environment adds an additional manual-approval gate.
+  #
+  #  Required GitHub secrets / variables:
+  #
+  #  Fly.io option (primary):
+  #    Secrets : FLY_API_TOKEN_PROD
+  #    Variables: FLY_APP_PROD, PROD_URL
+  #
+  #  SSH + Docker option (alternative):
+  #    Secrets : PROD_SSH_KEY, PROD_SSH_USER, PROD_HOST, PROD_DATABASE_URL
+  #    Variables: PROD_URL
+  #
+  deploy-prod:
+    name: Deploy → Production
+    needs: docker
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.PROD_URL }}
+    steps:
+      - name: Deploy
+        run: |
+          set -euo pipefail
+          IMAGE="${{ needs.docker.outputs.image }}:${{ needs.docker.outputs.tag }}"
+          echo "Image: $IMAGE"
+
+          if [[ -n "${FLY_API_TOKEN:-}" && -n "${FLY_APP:-}" ]]; then
+            echo "▶ Deploying via Fly.io → $FLY_APP"
+            curl -fsSL https://fly.io/install.sh | sh
+            export PATH="$HOME/.fly/bin:$PATH"
+            fly deploy --app "$FLY_APP" --image "$IMAGE" --strategy rolling
+
+          elif [[ -n "${SSH_HOST:-}" ]]; then
+            echo "▶ Deploying via SSH → $SSH_HOST"
+            printf '%s' "$SSH_KEY" > /tmp/id_rsa && chmod 600 /tmp/id_rsa
+            ssh -i /tmp/id_rsa -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "
+              docker pull $IMAGE
+              docker stop plagiarism-prod 2>/dev/null || true
+              docker rm   plagiarism-prod 2>/dev/null || true
+              docker run -d --name plagiarism-prod -p 8000:8000 \
+                --env DATABASE_URL='$DATABASE_URL' \
+                --restart unless-stopped \
+                $IMAGE
+            "
+
+          else
+            echo "⚠  No deployment target configured for production."
+            echo "   Add FLY_API_TOKEN_PROD + FLY_APP_PROD  (Fly.io)"
+            echo "   or PROD_SSH_KEY + PROD_HOST             (SSH+Docker)"
+            echo "   in Settings → Secrets and Variables → Actions."
+          fi
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PROD }}
+          FLY_APP: ${{ vars.FLY_APP_PROD }}
+          SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+          SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          SSH_HOST: ${{ secrets.PROD_HOST }}
+          DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
