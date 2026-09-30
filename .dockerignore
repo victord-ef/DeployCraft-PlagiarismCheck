@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Dev / test
+tests/
+requirements-dev.txt
+.env
+*.db
+*.sqlite3
+
+# Git / CI
+.git/
+.github/
+
+# OS
+.DS_Store
+Thumbs.db

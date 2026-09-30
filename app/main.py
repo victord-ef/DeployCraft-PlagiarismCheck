@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
@@ -32,3 +33,11 @@ app.include_router(check.router, prefix="/api/v1")
 @app.get("/health", tags=["meta"])
 def health():
     return {"status": "ok", "version": settings.version}
+
+
+# Serve the built React frontend when running inside Docker.
+# The Dockerfile copies frontend/dist → /app/static before this runs.
+_static_dir = Path(__file__).parent.parent / "static"
+if _static_dir.exists():
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="frontend")
